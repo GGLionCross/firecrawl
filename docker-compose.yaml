@@ -1,19 +1,21 @@
+# Self-hosted Firecrawl for WSL2 (mirrored networking).
+#
+# Why host networking: Docker's bridge network on this WSL2 box cannot reach the
+# internet reliably (see the self-host-firecrawl Hermes skill). Every service
+# therefore shares the host's network namespace and gets a distinct 10xxx port.
+#
+# Consequence of host networking + WSL mirrored mode: anything bound to 0.0.0.0
+# is reachable on the LAN IP (behind the Windows/Hyper-V firewall). Everything
+# that accepts a listen address is pinned to 127.0.0.1 below. playwright-service
+# ignores HOST and listens on 0.0.0.0:10000; the API's worker health ports
+# (10004-10012) do the same. From Windows, "localhost" reaches all of these
+# because mirrored mode shares the loopback interface.
+#
+# Not persisted on purpose: redis, rabbitmq and nuq-postgres hold only in-flight
+# job state. `docker compose down` resets the queue, which is what you want.
 name: firecrawl
 
-x-common-service: &common-service
-  # NOTE: If you don't want to build the service locally,
-  # comment out the build: statement and uncomment the image: statement
-  # image: ghcr.io/firecrawl/firecrawl
-  build: apps/api
-
-  ulimits:
-    nofile:
-      soft: 65535
-      hard: 65535
-  networks:
-    - backend
-  extra_hosts:
-    - "host.docker.internal:host-gateway"
+x-logging: &logging
   logging:
     driver: "json-file"
     options:
@@ -21,199 +23,172 @@ x-common-service: &common-service
       max-file: "3"
       compress: "true"
 
-x-common-env: &common-env
-  REDIS_URL: ${REDIS_URL:-redis://redis:6379}
-  REDIS_RATE_LIMIT_URL: ${REDIS_RATE_LIMIT_URL:-${REDIS_URL:-redis://redis:6379}}
-  PLAYWRIGHT_MICROSERVICE_URL: ${PLAYWRIGHT_MICROSERVICE_URL:-http://playwright-service:3000/scrape}
-  POSTGRES_USER: ${POSTGRES_USER:-postgres}
-  POSTGRES_PASSWORD: "${POSTGRES_PASSWORD:-postgres}"
-  POSTGRES_DB: ${POSTGRES_DB:-postgres}
-  POSTGRES_HOST: ${POSTGRES_HOST:-nuq-postgres}
-  POSTGRES_PORT: ${POSTGRES_PORT:-5432}
-  USE_DB_AUTHENTICATION: ${USE_DB_AUTHENTICATION:-false}
-  NUM_WORKERS_PER_QUEUE: ${NUM_WORKERS_PER_QUEUE:-8}
-  CRAWL_CONCURRENT_REQUESTS: ${CRAWL_CONCURRENT_REQUESTS:-10}
-  MAX_CONCURRENT_JOBS: ${MAX_CONCURRENT_JOBS:-5}
-  BROWSER_POOL_SIZE: ${BROWSER_POOL_SIZE:-5}
-  OPENAI_API_KEY: ${OPENAI_API_KEY}
-  OPENAI_BASE_URL: ${OPENAI_BASE_URL}
-  MODEL_NAME: ${MODEL_NAME}
-  MODEL_EMBEDDING_NAME: ${MODEL_EMBEDDING_NAME}
-  OLLAMA_BASE_URL: ${OLLAMA_BASE_URL}
-  AUTUMN_SECRET_KEY: ${AUTUMN_SECRET_KEY}
-  SLACK_WEBHOOK_URL: ${SLACK_WEBHOOK_URL}
-  BULL_AUTH_KEY: ${BULL_AUTH_KEY}
-  TEST_API_KEY: ${TEST_API_KEY}
-  SUPABASE_ANON_TOKEN: ${SUPABASE_ANON_TOKEN}
-  SUPABASE_URL: ${SUPABASE_URL}
-  SUPABASE_SERVICE_TOKEN: ${SUPABASE_SERVICE_TOKEN}
-  SELF_HOSTED_WEBHOOK_URL: ${SELF_HOSTED_WEBHOOK_URL}
-  LOGGING_LEVEL: ${LOGGING_LEVEL}
-  PROXY_SERVER: ${PROXY_SERVER}
-  PROXY_USERNAME: ${PROXY_USERNAME}
-  PROXY_PASSWORD: ${PROXY_PASSWORD}
-  SEARXNG_ENDPOINT: ${SEARXNG_ENDPOINT}
-  SEARXNG_ENGINES: ${SEARXNG_ENGINES}
-  SEARXNG_CATEGORIES: ${SEARXNG_CATEGORIES}
-  # Set NUQ_BACKEND=fdb to run the queue on FoundationDB instead of Postgres
-  NUQ_BACKEND: ${NUQ_BACKEND}
-  FDB_CLUSTER_FILE: ${NUQ_BACKEND:+/var/fdb/fdb.cluster}
-
 services:
   playwright-service:
-    # NOTE: If you don't want to build the service locally,
-    # comment out the build: statement and uncomment the image: statement
-    # image: ghcr.io/firecrawl/playwright-service:latest
-    build: apps/playwright-service-ts
+    image: ghcr.io/firecrawl/playwright-service:latest
+    network_mode: host
+    restart: unless-stopped
     environment:
-      PORT: 3000
-      PROXY_SERVER: ${PROXY_SERVER}
-      PROXY_USERNAME: ${PROXY_USERNAME}
-      PROXY_PASSWORD: ${PROXY_PASSWORD}
-      ALLOW_LOCAL_WEBHOOKS: ${ALLOW_LOCAL_WEBHOOKS}
-      BLOCK_MEDIA: ${BLOCK_MEDIA}
-      # Configure maximum concurrent pages for Playwright browser instances
-      MAX_CONCURRENT_PAGES: ${CRAWL_CONCURRENT_REQUESTS:-10}
-    networks:
-      - backend
+      # Must match PLAYWRIGHT_MICROSERVICE_URL below. The original template left
+      # this at 3000, so every JS-rendered scrape silently fell back to plain fetch.
+      PORT: 10000
+      PROXY_SERVER: ${PROXY_SERVER:-}
+      PROXY_USERNAME: ${PROXY_USERNAME:-}
+      PROXY_PASSWORD: ${PROXY_PASSWORD:-}
+      ALLOW_LOCAL_WEBHOOKS: ${ALLOW_LOCAL_WEBHOOKS:-}
+      # Skip images/audio/video inside the headless browser: markdown output is
+      # unaffected and JS-heavy pages render several seconds faster.
+      BLOCK_MEDIA: ${BLOCK_MEDIA:-true}
+      MAX_CONCURRENT_PAGES: ${CRAWL_CONCURRENT_REQUESTS:-5}
     security_opt:
       - no-new-privileges:true
     cap_drop:
       - ALL
-    # Resource limits for Docker Compose (not Swarm)
-    cpus: 2.0
-    mem_limit: 4G
-    memswap_limit: 4G
-    logging:
-      driver: "json-file"
-      options:
-        max-size: "10m"
-        max-file: "3"
-        compress: "true"
     tmpfs:
       - /tmp/.cache:noexec,nosuid,size=1g
+    # A runaway Chromium is the one thing here that can eat the whole box.
+    mem_limit: 4G
+    memswap_limit: 4G
+    <<: *logging
 
   api:
-    <<: *common-service
-    environment:
-      <<: *common-env
-      HOST: "0.0.0.0"
-      PORT: ${INTERNAL_PORT:-3002}
-      EXTRACT_WORKER_PORT: ${EXTRACT_WORKER_PORT:-3004}
-      WORKER_PORT: ${WORKER_PORT:-3005}
-      NUQ_RABBITMQ_URL: amqp://rabbitmq:5672
-      HARNESS_STARTUP_TIMEOUT_MS: ${HARNESS_STARTUP_TIMEOUT_MS:-60000}
-      ENV: local
+    image: ghcr.io/firecrawl/firecrawl:latest
+    network_mode: host
+    restart: unless-stopped
+    ulimits:
+      nofile:
+        soft: 65535
+        hard: 65535
     depends_on:
       redis:
-        condition: service_started
+        condition: service_healthy
       playwright-service:
         condition: service_started
       rabbitmq:
         condition: service_healthy
-    ports:
-      - "${PORT:-3002}:${INTERNAL_PORT:-3002}"
-    volumes:
-      - fdb-cluster-file:/var/fdb:ro
+      nuq-postgres:
+        condition: service_healthy
+      searxng:
+        condition: service_healthy
+    environment:
+      REDIS_URL: redis://127.0.0.1:10379
+      REDIS_RATE_LIMIT_URL: redis://127.0.0.1:10379
+      PLAYWRIGHT_MICROSERVICE_URL: http://127.0.0.1:10000/scrape
+      POSTGRES_USER: ${POSTGRES_USER:-postgres}
+      POSTGRES_PASSWORD: "${POSTGRES_PASSWORD:-postgres}"
+      POSTGRES_DB: ${POSTGRES_DB:-postgres}
+      POSTGRES_HOST: 127.0.0.1
+      POSTGRES_PORT: 10432
+      NUQ_RABBITMQ_URL: amqp://127.0.0.1:10672
+      USE_DB_AUTHENTICATION: "false"
+      # 12 cores / 16 GB shared with everything else on this box.
+      NUM_WORKERS_PER_QUEUE: ${NUM_WORKERS_PER_QUEUE:-4}
+      CRAWL_CONCURRENT_REQUESTS: ${CRAWL_CONCURRENT_REQUESTS:-5}
+      MAX_CONCURRENT_JOBS: ${MAX_CONCURRENT_JOBS:-3}
+      BROWSER_POOL_SIZE: ${BROWSER_POOL_SIZE:-3}
+      # Optional LLM features (/extract, json format). Leave empty to disable.
+      OPENAI_API_KEY: ${OPENAI_API_KEY:-}
+      OPENAI_BASE_URL: ${OPENAI_BASE_URL:-}
+      MODEL_NAME: ${MODEL_NAME:-}
+      MODEL_EMBEDDING_NAME: ${MODEL_EMBEDDING_NAME:-}
+      OLLAMA_BASE_URL: ${OLLAMA_BASE_URL:-}
+      # /search goes through the local SearXNG below (many engines, no single-
+      # engine rate limit). Without it Firecrawl scrapes DuckDuckGo directly and
+      # DDG blocks the IP after a few dozen queries.
+      SEARXNG_ENDPOINT: http://127.0.0.1:10080
+      SEARXNG_ENGINES: ${SEARXNG_ENGINES:-}
+      SEARXNG_CATEGORIES: ${SEARXNG_CATEGORIES:-general}
+      PROXY_SERVER: ${PROXY_SERVER:-}
+      PROXY_USERNAME: ${PROXY_USERNAME:-}
+      PROXY_PASSWORD: ${PROXY_PASSWORD:-}
+      SELF_HOSTED_WEBHOOK_URL: ${SELF_HOSTED_WEBHOOK_URL:-}
+      LOGGING_LEVEL: ${LOGGING_LEVEL:-info}
+      HARNESS_STARTUP_TIMEOUT_MS: ${HARNESS_STARTUP_TIMEOUT_MS:-60000}
+      ENV: local
+      # Loopback only -- see header. Windows still reaches it via localhost.
+      HOST: "127.0.0.1"
+      PORT: 10002
+      EXTRACT_WORKER_PORT: 10004
+      WORKER_PORT: 10005
+      # nuq workers default to 3006-3012, which collides with dev servers on a
+      # host-networked box. Keep the whole stack inside 10xxx.
+      NUQ_WORKER_START_PORT: 10006
     command: node dist/src/harness.js --start-docker
-    # Resource limits for Docker Compose (not Swarm)
-    # Increase if you have more CPU cores/RAM available
-    cpus: 4.0
-    mem_limit: 8G
-    memswap_limit: 8G
+    <<: *logging
 
   redis:
-    # NOTE: If you want to use Valkey (open source) instead of Redis (source available),
-    # uncomment the Valkey statement and comment out the Redis statement.
-    # Using Valkey with Firecrawl is untested and not guaranteed to work. Use with caution.
     image: redis:alpine
-    # image: valkey/valkey:alpine
-
-    networks:
-      - backend
-    command: redis-server --bind 0.0.0.0
-    logging:
-      driver: "json-file"
-      options:
-        max-size: "5m"
-        max-file: "2"
-        compress: "true"
+    network_mode: host
+    restart: unless-stopped
+    command: redis-server --bind 127.0.0.1 --port 10379 --save "" --appendonly no
+    healthcheck:
+      test: ["CMD", "redis-cli", "-p", "10379", "ping"]
+      interval: 5s
+      timeout: 3s
+      retries: 5
+    <<: *logging
 
   rabbitmq:
-    image: rabbitmq:3-management
-    networks:
-      - backend
-    command: rabbitmq-server
+    # Plain image, not -management: the management plugin's stats collector was
+    # the second-busiest process in an idle broker and nothing here uses the UI.
+    image: rabbitmq:3-alpine
+    network_mode: host
+    restart: unless-stopped
+    environment:
+      RABBITMQ_NODE_PORT: 10672
+      RABBITMQ_NODE_IP_ADDRESS: 127.0.0.1
     healthcheck:
       test: ["CMD", "rabbitmq-diagnostics", "-q", "check_running"]
       interval: 5s
       timeout: 5s
-      retries: 3
-      start_period: 5s
-    logging:
-      driver: "json-file"
-      options:
-        max-size: "5m"
-        max-file: "2"
-        compress: "true"
+      retries: 6
+      start_period: 10s
+    <<: *logging
+
+  searxng:
+    # Meta-search backend for /v2/search. Config lives in ./searxng/settings.yml
+    # (json format enabled, loopback bind, limiter off -- only the api talks to it).
+    image: searxng/searxng:latest
+    network_mode: host
+    restart: unless-stopped
+    environment:
+      # The granian-based image takes its bind from env, not settings.yml.
+      GRANIAN_HOST: 127.0.0.1
+      GRANIAN_PORT: 10080
+      SEARXNG_BASE_URL: http://127.0.0.1:10080/
+      # Cookie-signing key; kept out of git. settings.yml holds a placeholder.
+      SEARXNG_SECRET: ${SEARXNG_SECRET:?set SEARXNG_SECRET in .env}
+    volumes:
+      - ./searxng:/etc/searxng:rw
+    cap_drop:
+      - ALL
+    cap_add:
+      - CHOWN
+      - SETGID
+      - SETUID
+    healthcheck:
+      test: ["CMD-SHELL", "wget -qO- 'http://127.0.0.1:10080/healthz' >/dev/null"]
+      interval: 5s
+      timeout: 3s
+      retries: 10
+      start_period: 15s
+    <<: *logging
 
   nuq-postgres:
-    # NOTE: If you don't want to build the image locally,
-    # comment out the build: statement and uncomment the image: statement
-    # image: ghcr.io/firecrawl/nuq-postgres:latest
-    build: apps/nuq-postgres
+    image: ghcr.io/firecrawl/nuq-postgres:latest
+    network_mode: host
+    restart: unless-stopped
     environment:
       POSTGRES_USER: ${POSTGRES_USER:-postgres}
       POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:-postgres}
       POSTGRES_DB: ${POSTGRES_DB:-postgres}
-    networks:
-      - backend
-    logging:
-      driver: "json-file"
-      options:
-        max-size: "10m"
-        max-file: "3"
-        compress: "true"
-
-  # FoundationDB queue backend (experimental). Enable by setting
-  # NUQ_BACKEND=fdb; the api container reads the shared cluster file from the
-  # fdb-cluster-file volume. Replaces nuq-postgres once stable.
-  foundationdb:
-    image: foundationdb/foundationdb:7.3.63
-    environment:
-      FDB_NETWORKING_MODE: container
-      FDB_COORDINATOR_PORT: 4500
-    networks:
-      - backend
-    volumes:
-      - fdb-data:/var/fdb/data
-      - fdb-cluster-file:/var/fdb
-    logging:
-      driver: "json-file"
-      options:
-        max-size: "10m"
-        max-file: "3"
-        compress: "true"
-
-  # one-shot: creates the database on first boot (no-op afterwards)
-  foundationdb-init:
-    image: foundationdb/foundationdb:7.3.63
-    depends_on:
-      - foundationdb
-    entrypoint:
-      - /bin/bash
-      - -c
-      - "sleep 5 && out=$(fdbcli -C /var/fdb/fdb.cluster --exec 'configure new single ssd' 2>&1); status=$$?; printf '%s\n' \"$$out\"; if [ \"$$status\" -eq 0 ]; then exit 0; fi; printf '%s\n' \"$$out\" | grep -Eiq 'already.*configured|database.*configured|database.*already exists'"
-    volumes:
-      - fdb-cluster-file:/var/fdb
-    networks:
-      - backend
-    restart: "no"
-
-networks:
-  backend:
-    driver: bridge
-
-volumes:
-  fdb-data:
-  fdb-cluster-file:
+    command: ["postgres", "-p", "10432", "-c", "listen_addresses=127.0.0.1"]
+    healthcheck:
+      # The API used to race PG's first-boot init and die on
+      # "password authentication failed"; gating on pg_isready fixes that.
+      test: ["CMD-SHELL", "pg_isready -h 127.0.0.1 -p 10432 -U ${POSTGRES_USER:-postgres}"]
+      interval: 5s
+      timeout: 3s
+      retries: 10
+      start_period: 10s
+    <<: *logging

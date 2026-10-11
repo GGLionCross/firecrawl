@@ -1,0 +1,19 @@
+# SearXNG for the local Firecrawl (/v2/search). Host networking, loopback only.
+use_default_settings: true
+general:
+  instance_name: firecrawl-searxng
+  enable_metrics: false
+server:
+  bind_address: "127.0.0.1"
+  port: 10080
+  secret_key: "overridden-by-SEARXNG_SECRET-env"  # real value in ../.env (gitignored)
+  limiter: false          # loopback-only, single client (the firecrawl api)
+  image_proxy: false
+search:
+  safe_search: 0
+  autocomplete: ""
+  formats:
+    - html
+    - json                # firecrawl calls ?format=json
+ui:
+  static_use_hash: true
